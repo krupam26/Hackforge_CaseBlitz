@@ -6,6 +6,7 @@
     "dev:mobile": "npm --prefix frontend/mobile-app run dev",
     "prebuild": "npm --prefix frontend install && npm --prefix frontend/mobile-app install",
     "build": "pip install -r requirements.txt && npm --prefix frontend run build && npm --prefix frontend/mobile-app run build",
-    "preview": "npm --prefix frontend run preview"
+    "preview": "npm --prefix frontend run preview",
+    "test:frontend": "node --experimental-strip-types --test frontend/mobile-app/tests/sensorProcessing.test.ts frontend/fleet-dashboard/tests/sse.test.ts"
   }
 }

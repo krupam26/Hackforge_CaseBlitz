@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   RefreshCw, 
   Download, 
@@ -30,6 +30,7 @@ import { ReviewQueueScreen, ReviewItem } from './components/screens/ReviewQueueS
 import { ScenarioSimulatorScreen } from './components/screens/ScenarioSimulatorScreen';
 import { ModelPerformanceScreen } from './components/screens/ModelPerformanceScreen';
 import { AuditLogsScreen } from './components/screens/AuditLogsScreen';
+import { takeSseMessages } from './utils/sse';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('fleet-monitor');
@@ -42,6 +43,10 @@ export default function App() {
   const [isDemoFallback, setIsDemoFallback] = useState<boolean>(false);
   const [syncRateEvents, setSyncRateEvents] = useState<number>(1240);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<'connecting' | 'connected' | 'reconnecting'>('connecting');
+  const [historyRefreshRevision, setHistoryRefreshRevision] = useState(0);
+  const lastEventId = useRef('');
+  const seenEventIds = useRef(new Set<string>());
 
   // Active Modals & Drawers
   const [selectedDriverForInvestigation, setSelectedDriverForInvestigation] = useState<DriverRecord | null>(null);
@@ -227,6 +232,59 @@ export default function App() {
     fetchFleetData();
   }, [fetchFleetData]);
 
+  // Authenticated SSE stream with bounded backoff and Last-Event-ID replay.
+  useEffect(() => {
+    let cancelled = false;
+    let controller: AbortController | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryDelay = 1000;
+    const connect = async () => {
+      if (cancelled) return;
+      controller = new AbortController();
+      try {
+        const token = sessionStorage.getItem('tm-auth-token') || 'demo-admin-session-token';
+        const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+        if (lastEventId.current) headers['Last-Event-ID'] = lastEventId.current;
+        const response = await fetch('/v1/events/stream', { headers, signal: controller.signal });
+        if (!response.ok || !response.body) throw new Error(`SSE unavailable (${response.status})`);
+        setStreamStatus('connected'); retryDelay = 1000;
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+        while (!cancelled) {
+          const { value, done } = await reader.read(); if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parsed = takeSseMessages(buffer); buffer = parsed.remainder;
+          for (const message of parsed.messages) {
+            const id = message.id;
+            if (message.event && message.event !== 'fleet-event') continue;
+            if (id && (id === lastEventId.current || seenEventIds.current.has(id))) continue;
+            let eventPayload: { driver_id?: unknown; event_type?: unknown };
+            try { eventPayload = JSON.parse(message.data); } catch { continue; }
+            if (typeof eventPayload.driver_id !== 'string' || typeof eventPayload.event_type !== 'string') continue;
+            if (id) {
+              lastEventId.current = id;
+              seenEventIds.current.add(id);
+              if (seenEventIds.current.size > 1000) seenEventIds.current.delete(seenEventIds.current.values().next().value!);
+            }
+            setSyncRateEvents((count) => count + 1);
+            setHistoryRefreshRevision((revision) => revision + 1);
+            if (reconcileTimer) clearTimeout(reconcileTimer);
+            reconcileTimer = setTimeout(() => void fetchFleetData(), 250); // Reconcile a burst of live events with the persisted snapshot.
+          }
+        }
+      } catch (error) {
+        if (cancelled || (error instanceof DOMException && error.name === 'AbortError')) return;
+      }
+      if (!cancelled) {
+        setStreamStatus('reconnecting');
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(30000, retryDelay * 2);
+      }
+    };
+    void connect();
+    return () => { cancelled = true; controller?.abort(); if (retryTimer) clearTimeout(retryTimer); if (reconcileTimer) clearTimeout(reconcileTimer); };
+  }, [fetchFleetData]);
+
   // Handle Review Resolution (POST /v1/review-queue/{session_id}/resolve)
   const handleResolveReview = async (
     sessionId: number,
@@ -408,8 +466,8 @@ export default function App() {
             </span>
           )}
           <span className="text-[#cbd5e1]">|</span>
-          <span className="text-[#565e74]">
-            Live Drivers: <strong>{drivers.length}</strong> · Open HITL Reviews: <strong>{openReviewCount}</strong>
+          <span className="text-[#565e74]" role="status" aria-live="polite" aria-label={`Fleet event stream ${streamStatus}`}>
+            Live Drivers: <strong>{drivers.length}</strong> · Open HITL Reviews: <strong>{openReviewCount}</strong> · Events: <strong>{streamStatus}</strong>
           </span>
         </div>
 
@@ -620,6 +678,7 @@ export default function App() {
       {/* Modals & Slide-over Drawers */}
       <InvestigateDrawer
         driver={selectedDriverForInvestigation}
+        refreshRevision={historyRefreshRevision}
         onClose={() => setSelectedDriverForInvestigation(null)}
         onFreezeSession={(driver) => setSelectedDriverForFreeze(driver)}
         onTriggerLiveness={(driver) => setSelectedDriverForLiveness(driver)}

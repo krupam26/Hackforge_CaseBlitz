@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
@@ -191,14 +192,23 @@ GOOGLE_REDIRECT_URI = os.getenv(
 
 # ---------- Request / response contracts ----------
 
+class ClientTelemetryEvent(BaseModel):
+    event_type: str = Field(pattern="^(delivery_order_accepted|driver_session_paused|driver_session_resumed|driver_stop_detected)$")
+    timestamp: datetime
+
+
 class SessionIngest(BaseModel):
     driver_id: str = Field(min_length=1, max_length=100)
     device_id: str | None = None
     ip_subnet: str | None = None
     zone: str | None = None
+    zone_timestamp: datetime | None = None
     accel: list[Any] = Field(default_factory=list, max_length=500)  # [{x,y,z,t}] or [magnitude, ...]
     gyro: list[Any] = Field(default_factory=list, max_length=500)
+    accel_timestamps: list[datetime] = Field(default_factory=list, max_length=500)
+    gyro_timestamps: list[datetime] = Field(default_factory=list, max_length=500)
     touch_events: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
+    client_events: list[ClientTelemetryEvent] = Field(default_factory=list, max_length=20)
     gps: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
     vehicle_speed_mph: float | None = Field(default=None, ge=0)
     is_simulated: bool = Field(default=False)
@@ -222,6 +232,16 @@ class ResolveReview(BaseModel):
     resolution: str = Field(
         pattern="^(cleared|confirmed_handoff|needs_follow_up)$"
     )
+    reviewer_note: str | None = Field(default=None, max_length=1000)
+
+
+class VerificationSubmission(BaseModel):
+    challenge_id: str = Field(min_length=1, max_length=128)
+    captured_at: datetime
+
+
+class VerificationDecision(BaseModel):
+    status: str = Field(pattern="^(successful|failed|escalated)$")
     reviewer_note: str | None = Field(default=None, max_length=1000)
 
 
@@ -280,6 +300,19 @@ def init_db() -> None:
             timestamp TEXT NOT NULL,
             event_type TEXT NOT NULL,
             details_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telemetry_batches (
+            batch_id TEXT PRIMARY KEY,
+            driver_id TEXT NOT NULL DEFAULT '',
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS verification_requests (
+            challenge_id TEXT PRIMARY KEY,
+            driver_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            captured_at TEXT,
+            updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS review_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,6 +389,11 @@ def init_db() -> None:
         }
         if "name" not in admin_columns:
             con.execute("ALTER TABLE admin_users ADD COLUMN name TEXT")
+        batch_columns = {
+            row["name"] for row in con.execute("PRAGMA table_info(telemetry_batches)").fetchall()
+        }
+        if "driver_id" not in batch_columns:
+            con.execute("ALTER TABLE telemetry_batches ADD COLUMN driver_id TEXT NOT NULL DEFAULT ''")
         if "provider" not in admin_columns:
             con.execute("ALTER TABLE admin_users ADD COLUMN provider TEXT DEFAULT 'email'")
         if "avatar_url" not in admin_columns:
@@ -1342,10 +1380,19 @@ def auth_me(admin: dict[str, str] = Depends(require_admin)) -> dict:
 def ingest_session(
     body: SessionIngest,
     x_driver_token: str | None = Header(default=None, alias="X-Driver-Token"),
+    x_telemetry_batch_id: str | None = Header(default=None, alias="X-Telemetry-Batch-Id"),
 ) -> dict:
     """Ingest a session only from the driver app/token assigned to this driver ID."""
     if x_driver_token is not None and isinstance(x_driver_token, str) and x_driver_token.strip():
         require_driver_token(body.driver_id, x_driver_token.strip())
+    batch_id = (x_telemetry_batch_id or "").strip()
+    if batch_id:
+        if len(batch_id) > 128:
+            raise HTTPException(status_code=400, detail="Invalid telemetry batch ID")
+        with connect() as con:
+            saved = con.execute("SELECT response_json FROM telemetry_batches WHERE batch_id=? AND driver_id=?", (batch_id, body.driver_id)).fetchone()
+            if saved:
+                return decode_json(saved["response_json"], {})
     current_context = {
         "device_id": body.device_id,
         "ip_subnet": body.ip_subnet,
@@ -1438,6 +1485,13 @@ def ingest_session(
                 (json.dumps(result), now_iso(), body.driver_id),
             )
             write_event(con, body.driver_id, "baseline_established", {"context": current_context})
+            for item in body.client_events:
+                write_event(con, body.driver_id, item.event_type, {"timestamp": item.timestamp.isoformat()})
+            if batch_id:
+                con.execute(
+                    "INSERT OR IGNORE INTO telemetry_batches(batch_id,driver_id,response_json,created_at) VALUES(?,?,?,?)",
+                    (batch_id, body.driver_id, json.dumps(result), now_iso()),
+                )
             return result
 
         # A pending declaration is supporting context only. It never bypasses scoring.
@@ -1801,6 +1855,11 @@ def ingest_session(
              now_iso(), body.driver_id),
         )
         write_event(con, body.driver_id, "session_scored", result)
+        for item in body.client_events:
+            write_event(con, body.driver_id, item.event_type, {"timestamp": item.timestamp.isoformat()})
+        if batch_id:
+            con.execute("INSERT OR IGNORE INTO telemetry_batches(batch_id,driver_id,response_json,created_at) VALUES(?,?,?,?)",
+                        (batch_id, body.driver_id, json.dumps(result), now_iso()))
 
     broadcast_event_sync("session_scored", {
         "session_id": session_id,
@@ -1822,6 +1881,41 @@ def ingest_session(
     return result
 
 
+@app.get("/v1/events/stream")
+async def event_stream(
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    admin: dict[str, str] = Depends(require_admin),
+) -> StreamingResponse:
+    """Authenticated SSE stream of newly persisted fleet events; reconnect with Last-Event-ID."""
+    async def stream():
+        try:
+            cursor = max(0, int(last_event_id or "0"))
+        except ValueError:
+            cursor = 0
+        if not last_event_id:
+            with connect() as con:
+                row = con.execute("SELECT COALESCE(MAX(id),0) AS latest_id FROM events").fetchone()
+                cursor = int(row["latest_id"])
+        try:
+            while True:
+                with connect() as con:
+                    rows = con.execute(
+                        "SELECT id,driver_id,timestamp,event_type,details_json FROM events WHERE id>? ORDER BY id LIMIT 100",
+                        (cursor,),
+                    ).fetchall()
+                for row in rows:
+                    cursor = row["id"]
+                    item = {"id": cursor, "driver_id": row["driver_id"], "timestamp": row["timestamp"],
+                            "event_type": row["event_type"], "details": decode_json(row["details_json"], {})}
+                    yield f"id: {cursor}\nevent: fleet-event\ndata: {json.dumps(item)}\n\n"
+                if not rows:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            return
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/v1/drivers/{driver_id}/score")
 def driver_score(
     driver_id: str, admin: dict[str, str] = Depends(require_admin)
@@ -1834,7 +1928,7 @@ def driver_score(
         sessions = con.execute(
             """SELECT id,timestamp,context_score,behavior_score,context_axis,
                behavior_axis,quadrant,decision,reasons_json
-               FROM sessions WHERE driver_id=? ORDER BY id DESC LIMIT 10""",
+               FROM sessions WHERE driver_id=? ORDER BY id DESC LIMIT 100""",
             (driver_id,),
         ).fetchall()
         result["history"] = [
@@ -2547,20 +2641,86 @@ def webhook_test(admin: dict[str, str] = Depends(require_admin)) -> dict:
 
 @app.get("/v1/drivers/{driver_id}/events")
 def driver_events(
-    driver_id: str, admin: dict[str, str] = Depends(require_admin)
+    driver_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    admin: dict[str, str] = Depends(require_admin),
 ) -> dict:
     with connect() as con:
         exists = con.execute("SELECT 1 FROM drivers WHERE driver_id=?", (driver_id,)).fetchone()
         if not exists:
             raise HTTPException(status_code=404, detail="Driver not found")
         rows = con.execute(
-            "SELECT timestamp,event_type,details_json FROM events WHERE driver_id=? ORDER BY id DESC LIMIT 50",
-            (driver_id,),
+            "SELECT id,timestamp,event_type,details_json FROM events WHERE driver_id=? ORDER BY id DESC LIMIT ?",
+            (driver_id, limit),
         ).fetchall()
         return {"driver_id": driver_id, "events": [
-            {"timestamp": r["timestamp"], "event_type": r["event_type"],
+            {"id": r["id"], "timestamp": r["timestamp"], "event_type": r["event_type"],
              "details": decode_json(r["details_json"], {})} for r in rows
         ]}
+
+
+@app.post("/v1/drivers/{driver_id}/verification")
+def submit_verification(
+    driver_id: str,
+    body: VerificationSubmission,
+    x_driver_token: str | None = Header(default=None, alias="X-Driver-Token"),
+) -> dict:
+    """Record a camera capture for a separately reviewed challenge; never accept/store face images here."""
+    require_driver_token(driver_id, x_driver_token)
+    with connect() as con:
+        con.execute(
+            "INSERT INTO verification_requests(challenge_id,driver_id,status,captured_at,updated_at) VALUES(?,?,'pending',?,?) "
+            "ON CONFLICT(challenge_id) DO UPDATE SET captured_at=excluded.captured_at,updated_at=excluded.updated_at "
+            "WHERE verification_requests.driver_id=excluded.driver_id",
+            (body.challenge_id, driver_id, body.captured_at.isoformat(), now_iso()),
+        )
+        row = con.execute("SELECT driver_id,status,captured_at,updated_at FROM verification_requests WHERE challenge_id=?", (body.challenge_id,)).fetchone()
+        if row is None or row["driver_id"] != driver_id:
+            raise HTTPException(status_code=409, detail="Challenge ID belongs to another driver")
+        write_event(con, driver_id, "verification_submitted", {"challenge_id": body.challenge_id, "status": row["status"]})
+        return {"challenge_id": body.challenge_id, "status": row["status"], "captured_at": row["captured_at"], "updated_at": row["updated_at"]}
+
+
+@app.get("/v1/drivers/{driver_id}/verification/{challenge_id}")
+def verification_status(
+    driver_id: str,
+    challenge_id: str,
+    x_driver_token: str | None = Header(default=None, alias="X-Driver-Token"),
+) -> dict:
+    require_driver_token(driver_id, x_driver_token)
+    with connect() as con:
+        row = con.execute("SELECT challenge_id,status,captured_at,updated_at FROM verification_requests WHERE challenge_id=? AND driver_id=?", (challenge_id, driver_id)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Verification challenge not found")
+    return dict(row)
+
+
+@app.post("/v1/admin/drivers/{driver_id}/verification/{challenge_id}")
+def decide_verification(
+    driver_id: str,
+    challenge_id: str,
+    body: VerificationDecision,
+    admin: dict[str, str] = Depends(require_admin),
+) -> dict:
+    """Record the authoritative result supplied by the configured liveness/review provider."""
+    with connect() as con:
+        row = con.execute(
+            "SELECT challenge_id,status FROM verification_requests WHERE challenge_id=? AND driver_id=?",
+            (challenge_id, driver_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Verification challenge not found")
+        con.execute(
+            "UPDATE verification_requests SET status=?,updated_at=? WHERE challenge_id=? AND driver_id=?",
+            (body.status, now_iso(), challenge_id, driver_id),
+        )
+        write_event(con, driver_id, "verification_decided", {
+            "challenge_id": challenge_id,
+            "status": body.status,
+            "reviewer": admin.get("username"),
+            "reviewer_note": body.reviewer_note,
+        })
+    return {"challenge_id": challenge_id, "status": body.status, "updated_at": now_iso()}
 
 
 # ---------- Admin review workflow (authentication-protected) ----------

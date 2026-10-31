@@ -20,20 +20,46 @@ import { DriverAvatar } from '../DriverAvatar';
 
 interface InvestigateDrawerProps {
   driver: DriverRecord | null;
+  refreshRevision: number;
   onClose: () => void;
   onFreezeSession: (driver: DriverRecord) => void;
   onTriggerLiveness: (driver: DriverRecord) => void;
 }
 
+function filteredHistoryLength(records: any[], from: string, to: string, risk: 'all' | 'challenge' | 'continue') {
+  return records.filter((entry) => {
+    if (!Number.isFinite(entry.context_score) || !Number.isFinite(entry.behavior_score)) return false;
+    const timestamp = new Date(entry.timestamp);
+    if (!Number.isFinite(timestamp.getTime())) return false;
+    const date = timestamp.toISOString().slice(0, 10);
+    if ((from && date < from) || (to && date > to)) return false;
+    const challenged = /challenge|step_up|escalat/i.test(entry.decision || '');
+    return risk === 'all' || (risk === 'challenge' ? challenged : !challenged);
+  }).length;
+}
+
 export const InvestigateDrawer: React.FC<InvestigateDrawerProps> = ({
   driver,
+  refreshRevision,
   onClose,
   onFreezeSession,
   onTriggerLiveness,
 }) => {
   const [activeTab, setActiveTab] = useState<'score' | 'lineage' | 'sensors' | 'biometrics' | 'history'>('score');
   const [scoreData, setScoreData] = useState<any>(null);
+  const [driverEvents, setDriverEvents] = useState<any[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(0);
   const [isLoadingScore, setIsLoadingScore] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyFrom, setHistoryFrom] = useState('');
+  const [historyTo, setHistoryTo] = useState('');
+  const [historyRisk, setHistoryRisk] = useState<'all' | 'challenge' | 'continue'>('all');
+  const [eventTypeFilter, setEventTypeFilter] = useState('all');
+  const [verificationOutcome, setVerificationOutcome] = useState('all');
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [hoveredHistory, setHoveredHistory] = useState<any>(null);
+  const [hoveredEvent, setHoveredEvent] = useState<any>(null);
+  const previousDriverId = React.useRef<string | null>(null);
   const [operatorNote, setOperatorNote] = useState('');
   const [notesList, setNotesList] = useState<string[]>([
     'Flagged for immediate review following cell tower divergence from route manifest on Western Express Highway.',
@@ -42,20 +68,56 @@ export const InvestigateDrawer: React.FC<InvestigateDrawerProps> = ({
 
   React.useEffect(() => {
     if (!driver) return;
+    const controller = new AbortController();
+    const driverChanged = previousDriverId.current !== driver.id;
+    previousDriverId.current = driver.id;
     setIsLoadingScore(true);
+    setHistoryError('');
+    if (driverChanged) { setScoreData(null); setDriverEvents([]); setHistoryIndex(0); setIsPlaying(false); setHistoryFrom(''); setHistoryTo(''); setHistoryRisk('all'); setEventTypeFilter('all'); setVerificationOutcome('all'); }
     const token = sessionStorage.getItem('tm-auth-token') || 'demo-admin-session-token';
-    fetch(`/v1/drivers/${driver.id}/score`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => setScoreData(data))
-      .catch(() => setScoreData(null))
-      .finally(() => setIsLoadingScore(false));
-  }, [driver?.id]);
+    const options = { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal };
+    Promise.all([
+      fetch(`/v1/drivers/${encodeURIComponent(driver.id)}/score`, options),
+      fetch(`/v1/drivers/${encodeURIComponent(driver.id)}/events`, options),
+    ]).then(async ([scores, events]) => {
+      if (!scores.ok) throw new Error(`History unavailable (HTTP ${scores.status}).`);
+      if (!events.ok) throw new Error(`Event history unavailable (HTTP ${events.status}).`);
+      const [scoreJson, eventJson] = await Promise.all([scores.json(), events.json()]);
+      if (!controller.signal.aborted) { setScoreData(scoreJson); setDriverEvents(eventJson.events || []); }
+    }).catch((error) => {
+      if (!controller.signal.aborted) setHistoryError(error instanceof Error ? error.message : 'Unable to load driver history.');
+    }).finally(() => { if (!controller.signal.aborted) setIsLoadingScore(false); });
+    return () => controller.abort();
+  }, [driver?.id, refreshRevision]);
+
+  React.useEffect(() => {
+    if (!isPlaying) return;
+    const timer = window.setInterval(() => setHistoryIndex((index) => {
+      const max = Math.max(0, filteredHistoryLength(scoreData?.history || [], historyFrom, historyTo, historyRisk) - 1);
+      return Math.min(max, index + 1);
+    }), 900);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, scoreData?.history, historyFrom, historyTo, historyRisk]);
+  React.useEffect(() => {
+    if (isPlaying && historyIndex >= filteredHistoryLength(scoreData?.history || [], historyFrom, historyTo, historyRisk) - 1) setIsPlaying(false);
+  }, [isPlaying, historyIndex, scoreData?.history, historyFrom, historyTo, historyRisk]);
 
   if (!driver) return null;
+
+  const allHistoryPoints = [...(scoreData?.history || [])].reverse().filter((entry: any) => Number.isFinite(entry.context_score) && Number.isFinite(entry.behavior_score));
+  const inRange = (timestamp: string) => {
+    const parsed = new Date(timestamp);
+    if (!Number.isFinite(parsed.getTime())) return false;
+    const date = parsed.toISOString().slice(0, 10);
+    return (!historyFrom || date >= historyFrom) && (!historyTo || date <= historyTo);
+  };
+  const historyPoints = allHistoryPoints.filter((entry: any) => inRange(entry.timestamp) &&
+    (historyRisk === 'all' || (historyRisk === 'challenge' ? /challenge|step_up|escalat/i.test(entry.decision || '') : !/challenge|step_up|escalat/i.test(entry.decision || ''))));
+  const selectedHistory = historyPoints[Math.min(historyIndex, Math.max(0, historyPoints.length - 1))] || null;
+  const filteredEvents = driverEvents.filter((event) => inRange(event.timestamp) &&
+    (eventTypeFilter === 'all' || event.event_type === eventTypeFilter) &&
+    (verificationOutcome === 'all' || (event.event_type.startsWith('verification') && event.details?.status === verificationOutcome)));
+  const trajectoryPoint = (entry: any) => `${12 + (Number(entry.context_score || 0) * 76)},${88 - (Number(entry.behavior_score || 0) * 76)}`;
 
 
   const handleAddNote = (e: React.FormEvent) => {
@@ -291,8 +353,59 @@ export const InvestigateDrawer: React.FC<InvestigateDrawerProps> = ({
                   {/* Session History Dossier */}
                   <div className="space-y-2">
                     <span className="font-bold text-[#0b1c30] block uppercase tracking-wider text-[11px]">
-                      Session Score History (Past 10 Telemetry Ingests)
+                      Session Score History (Past 100 Telemetry Ingests)
                     </span>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-2 rounded-lg border border-[#e2e8f0] bg-white p-3 text-[10px]">
+                      <label className="space-y-1">From<input aria-label="History start date" type="date" value={historyFrom} onChange={(event) => { setHistoryFrom(event.target.value); setHistoryIndex(0); }} className="block w-full rounded border border-[#cbd5e1] p-1.5 text-xs" /></label>
+                      <label className="space-y-1">To<input aria-label="History end date" type="date" value={historyTo} onChange={(event) => { setHistoryTo(event.target.value); setHistoryIndex(0); }} className="block w-full rounded border border-[#cbd5e1] p-1.5 text-xs" /></label>
+                      <label className="space-y-1">Risk decision<select aria-label="Filter history by risk decision" value={historyRisk} onChange={(event) => { setHistoryRisk(event.target.value as typeof historyRisk); setHistoryIndex(0); }} className="block w-full rounded border border-[#cbd5e1] p-1.5 text-xs"><option value="all">All decisions</option><option value="challenge">Challenge / escalation</option><option value="continue">Continue / other</option></select></label>
+                      <label className="space-y-1">Event type<select aria-label="Filter events by type" value={eventTypeFilter} onChange={(event) => setEventTypeFilter(event.target.value)} className="block w-full rounded border border-[#cbd5e1] p-1.5 text-xs"><option value="all">All event types</option>{[...new Set(driverEvents.map((event) => event.event_type))].sort().map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}</select></label>
+                      <label className="space-y-1">Verification outcome<select aria-label="Filter verification outcome" value={verificationOutcome} onChange={(event) => setVerificationOutcome(event.target.value)} className="block w-full rounded border border-[#cbd5e1] p-1.5 text-xs"><option value="all">All outcomes</option><option value="pending">Pending</option><option value="successful">Successful</option><option value="failed">Failed</option><option value="escalated">Escalated</option></select></label>
+                    </div>
+                    {isLoadingScore && <div role="status" className="rounded-lg border border-[#e2e8f0] p-4 text-center text-xs text-[#565e74]">Loading score and event history…</div>}
+                    {!!historyError && <div role="alert" className="rounded-lg border border-[#f4c7c3] bg-[#fff1ef] p-3 text-xs text-[#8b211b]">{historyError}</div>}
+                    {historyPoints.length > 0 && (
+                      <div className="rounded-xl border border-[#e2e8f0] bg-[#f8f9ff] p-3 space-y-3">
+                        <div className="flex items-center justify-between text-[10px] font-semibold text-[#565e74]">
+                          <span>Historical continuity trajectory · {historyPoints.length} sessions</span>
+                          <span>{selectedHistory ? new Date(selectedHistory.timestamp).toLocaleString() : ''}</span>
+                        </div>
+                        <svg viewBox="0 0 100 100" role="img" aria-label="Contextual continuity versus behavioral continuity historical trajectory" className="w-full h-36 rounded-lg bg-white border border-[#e2e8f0]">
+                          <path d="M50 0V100M0 50H100" stroke="#dbe3ef" strokeDasharray="2 2" />
+                          <polyline points={historyPoints.map(trajectoryPoint).join(' ')} fill="none" stroke="#0058be" strokeWidth="1.5" />
+                          {historyPoints.map((entry: any, index: number) => {
+                            const [cx, cy] = trajectoryPoint(entry).split(',');
+                            return <circle key={entry.session_id} cx={cx} cy={cy} r={index === historyIndex ? 3.2 : 2} fill={entry.decision?.includes('challenge') ? '#ba1a1a' : '#0058be'} onClick={() => setHistoryIndex(index)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setHistoryIndex(index); } }} onMouseEnter={() => setHoveredHistory(entry)} onMouseLeave={() => setHoveredHistory(null)} onFocus={() => setHoveredHistory(entry)} onBlur={() => setHoveredHistory(null)} tabIndex={0} role="button" aria-label={`Session ${entry.session_id}, context ${Math.round(entry.context_score * 100)} percent, behavior ${Math.round(entry.behavior_score * 100)} percent, ${entry.decision}`} className="cursor-pointer"><title>{new Date(entry.timestamp).toLocaleString()} · C {(entry.context_score * 100).toFixed(0)}% · B {(entry.behavior_score * 100).toFixed(0)}% · {entry.decision}</title></circle>;
+                          })}
+                          {filteredEvents.map((event: any) => {
+                            if (!historyPoints.length) return null;
+                            const eventAt = new Date(event.timestamp).getTime();
+                            const nearest = historyPoints.reduce((best: any, entry: any) => Math.abs(new Date(entry.timestamp).getTime() - eventAt) < Math.abs(new Date(best.timestamp).getTime() - eventAt) ? entry : best, historyPoints[0]);
+                            const [cx, cy] = trajectoryPoint(nearest).split(',');
+                            return <g key={`event-${event.id ?? `${event.timestamp}-${event.event_type}`}`} tabIndex={0} role="img" aria-label={`${event.event_type.replaceAll('_', ' ')} at ${new Date(event.timestamp).toLocaleString()}`} onMouseEnter={() => setHoveredEvent(event)} onMouseLeave={() => setHoveredEvent(null)} onFocus={() => setHoveredEvent(event)} onBlur={() => setHoveredEvent(null)} className="cursor-help"><title>{event.event_type.replaceAll('_', ' ')} · {new Date(event.timestamp).toLocaleString()} · {event.details?.status || event.details?.decision || ''}</title><path d={`M ${Number(cx)} ${Number(cy) - 3} l 3 5 h -6 z`} fill={event.event_type.startsWith('verification') ? '#d97706' : '#7c3aed'} stroke="white" strokeWidth="0.7" /></g>;
+                          })}
+                          <text x="56" y="96" fontSize="4" fill="#565e74">Context continuity →</text>
+                          <text x="2" y="6" fontSize="4" fill="#565e74">Behavior ↑</text>
+                        </svg>
+                        <label className="flex items-center gap-3 text-[10px] text-[#565e74]">
+                          <span>Earlier</span>
+                          <input aria-label="Select historical session" className="w-full accent-[#0058be]" type="range" min={0} max={Math.max(0, historyPoints.length - 1)} value={historyIndex} onChange={(event) => setHistoryIndex(Number(event.target.value))} />
+                          <span>Latest</span>
+                        </label>
+                        <div className="flex items-center gap-2"><button type="button" onClick={() => setIsPlaying((playing) => !playing)} className="rounded bg-[#0058be] px-3 py-1.5 text-[10px] font-bold text-white" aria-label={isPlaying ? 'Pause history playback' : 'Play history playback'}>{isPlaying ? 'Pause' : 'Play history'}</button><span className="text-[10px] text-[#565e74]">{historyPoints.length} scored points · {filteredEvents.length} matching events</span></div>
+                        {hoveredHistory && <div role="status" className="rounded bg-white p-2 font-mono text-[10px] text-[#0b1c30]">{new Date(hoveredHistory.timestamp).toLocaleString()} · Session #{hoveredHistory.session_id} · Context {(hoveredHistory.context_score * 100).toFixed(0)}% · Behavior {(hoveredHistory.behavior_score * 100).toFixed(0)}% · {hoveredHistory.decision}</div>}
+                        {hoveredEvent && <div role="status" className="rounded bg-amber-50 p-2 text-[10px] text-[#70420d]">{hoveredEvent.event_type.replaceAll('_', ' ')} · {new Date(hoveredEvent.timestamp).toLocaleString()} · {hoveredEvent.details?.status || hoveredEvent.details?.decision || 'No additional event details'}</div>}
+                        {selectedHistory && <div className="font-mono text-[10px] text-[#0b1c30]">Session #{selectedHistory.session_id} · Context {(Number(selectedHistory.context_score || 0) * 100).toFixed(0)}% · Behavior {(Number(selectedHistory.behavior_score || 0) * 100).toFixed(0)}% · {selectedHistory.decision}</div>}
+                      </div>
+                    )}
+                    {scoreData?.history?.length > 0 && historyPoints.length === 0 && <div className="rounded-lg border border-[#e2e8f0] bg-[#f8f9ff] p-3 text-[11px] text-[#565e74]">History is available, but no sessions have scored continuity values to plot yet.</div>}
+                    {!isLoadingScore && !historyError && filteredEvents.length === 0 && <div className="rounded-lg border border-[#e2e8f0] bg-[#f8f9ff] p-3 text-[11px] text-[#565e74]">No events match this driver's date, type, and outcome filters.</div>}
+                    {filteredEvents.length > 0 && <div className="max-h-44 overflow-y-auto rounded-lg border border-[#e2e8f0] divide-y divide-[#e2e8f0]" aria-label="Filtered driver events">
+                      {filteredEvents.slice().reverse().slice(0, 12).map((event: any) => <div key={event.id ?? `${event.timestamp}-${event.event_type}`} className="flex items-start justify-between gap-3 bg-white px-3 py-2 text-[10px]">
+                        <span className="font-semibold text-[#0b1c30]">{event.event_type.replaceAll('_', ' ')} <span className="font-normal text-[#565e74]">{event.details?.status || event.details?.decision || event.details?.reasons?.[0] || ''}</span></span>
+                        <time className="shrink-0 text-[#565e74]">{new Date(event.timestamp).toLocaleString()}</time>
+                      </div>)}
+                    </div>}
                     {scoreData?.history && scoreData.history.length > 0 ? (
                       <div className="border border-[#e2e8f0] rounded-xl overflow-hidden shadow-2xs divide-y divide-[#f1f5f9] text-xs">
                         {scoreData.history.map((s: any) => (

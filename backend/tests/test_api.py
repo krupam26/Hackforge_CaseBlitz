@@ -333,3 +333,24 @@ def test_continuous_simulator_toggle(client: TestClient):
     stop_resp = client.post("/v1/fleet/simulator/auto-toggle?enable=false")
     assert stop_resp.status_code == 200
     assert stop_resp.json()["active"] is False
+
+
+def test_telemetry_batch_retry_is_idempotent_and_records_stop_event_once(client: TestClient):
+    driver_id = "test-idempotent-stop-batch"
+    payload = session_payload(driver_id, client_events=[{
+        "event_type": "driver_stop_detected",
+        "timestamp": "2026-10-30T10:00:00Z",
+    }])
+    headers = {"X-Telemetry-Batch-Id": "test-idempotent-stop-001"}
+    first = client.post("/v1/sessions/ingest", json=payload, headers=headers)
+    second = client.post("/v1/sessions/ingest", json=payload, headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+
+    events = client.get(
+        f"/v1/drivers/{driver_id}/events",
+        headers=admin_headers(client),
+    )
+    assert events.status_code == 200, events.text
+    recorded = [event for event in events.json()["events"] if event["event_type"] == "driver_stop_detected"]
+    assert len(recorded) == 1

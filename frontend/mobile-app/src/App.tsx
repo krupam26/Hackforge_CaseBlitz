@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getChallengeStatus, goOffline, goOnlineAndIngest, recordOrderAccept, recordOrderOffer,
-  recordPrecisionConsent, respondToChallenge,
+  recordPrecisionConsent, respondToChallenge, getQueueHealth, type QueueHealth,
 } from "./telemetry";
 
 type Tab = "home" | "orders" | "earnings" | "profile";
@@ -1731,6 +1731,9 @@ export default function App() {
   const [page, setPage] = useState<Page>("home");
   const [lastTab, setLastTab] = useState<Tab>("home");
   const [online, setOnline] = useState(false);
+  const [networkAvailable, setNetworkAvailable] = useState(navigator.onLine);
+  const [queueHealth, setQueueHealth] = useState<QueueHealth>({ pending: 0, retrying: 0, oldest: null, nextRetryAt: null });
+  const [signalDiagnostics, setSignalDiagnostics] = useState<Record<string, { available: boolean; detail?: string }>>({});
   const [requestVisible, setRequestVisible] = useState(true);
   const [activeOrder, setActiveOrder] = useState<Order | null>(null);
   const [stage, setStage] = useState(0);
@@ -1749,6 +1752,25 @@ export default function App() {
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [page]);
+
+  useEffect(() => {
+    void getQueueHealth().then(setQueueHealth);
+    const onQueue = (event: Event) => setQueueHealth((event as CustomEvent<QueueHealth>).detail);
+    const onSignal = (event: Event) => {
+      const detail = (event as CustomEvent<{ signal: string; available: boolean; detail?: string }>).detail;
+      setSignalDiagnostics((current) => ({ ...current, [detail.signal]: detail }));
+    };
+    const onOnline = () => setNetworkAvailable(true);
+    const onOffline = () => setNetworkAvailable(false);
+    window.addEventListener("aslikaun:queue-health", onQueue);
+    window.addEventListener("aslikaun:signal-status", onSignal);
+    window.addEventListener("online", onOnline); window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("aslikaun:queue-health", onQueue);
+      window.removeEventListener("aslikaun:signal-status", onSignal);
+      window.removeEventListener("online", onOnline); window.removeEventListener("offline", onOffline);
+    };
+  }, []);
 
   useEffect(() => {
     if (online && requestVisible) recordOrderOffer();
@@ -1787,10 +1809,13 @@ export default function App() {
     const wantsPrecision = window.confirm(
       "Enable Enhanced Detection Mode? This sends your exact GPS location and full touch-gesture paths (not just coarse zone / tap timing) so account-handoff detection is more accurate. This data is used only for security scoring and is automatically purged after 30 days. You can decline and keep standard protection instead."
     );
-    await recordPrecisionConsent(wantsPrecision);
+    const precisionConsentRecorded = await recordPrecisionConsent(wantsPrecision);
+    if (wantsPrecision && !precisionConsentRecorded) {
+      window.alert("Enhanced detection could not record consent securely. Continuing with standard coarse-location protection.");
+    }
     // Browser permission prompts are triggered only after the driver explicitly chooses Go Online.
     setOnline(true);
-    await goOnlineAndIngest(wantsPrecision);
+    await goOnlineAndIngest(wantsPrecision && precisionConsentRecorded);
   };
 
   const navigate = (next: Page) => {
@@ -1856,6 +1881,16 @@ export default function App() {
         onNotifications={() => navigate("notifications")}
         unread={scenario.verification === "requested" || !!activeOrder}
       />
+      {(online || queueHealth.pending > 0 || Object.keys(signalDiagnostics).length > 0) && (
+        <section className="telemetry-diagnostics" aria-label="Telemetry connection and sensor diagnostics" aria-live="polite">
+          <span className={`diagnostic-pill ${online ? "ok" : "muted"}`}>{online ? "Collection on" : "Collection paused"}</span>
+          <span className={`diagnostic-pill ${networkAvailable ? "ok" : "warning"}`}>{networkAvailable ? "Online" : "Offline"}</span>
+          <span className="diagnostic-pill">Queue {queueHealth.pending} pending · {queueHealth.retrying} retrying</span>
+          {Object.entries(signalDiagnostics).filter(([, value]) => !value.available).slice(-3).map(([signal, value]) => (
+            <span key={signal} className="diagnostic-issue" title={value.detail}>{signal}: {value.detail || "unavailable"}</span>
+          ))}
+        </section>
+      )}
       {page === "home" && (
         <Home
           online={online}
